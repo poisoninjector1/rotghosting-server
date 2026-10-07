@@ -1,6 +1,5 @@
-fastapi
-uvicorn[standard]
-firebase-admin
-google-cloud-firestore
-python-multipart
-jinja2
+Flask>=3.1,<4
+firebase-admin>=7,<8
+google-cloud-firestore>=2.34,<3
+python-multipart>=0.0.20,<1
+jinja2>=3.1,<4
