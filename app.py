@@ -7,9 +7,7 @@ import sys
 import uuid
 import threading
 from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, File, Form, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse
-import uvicorn
+from flask import Flask, request, redirect, make_response, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
@@ -18,7 +16,8 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 
 
-app = FastAPI(title="Render & Firebase PaaS Cloud Hosting Engine")
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
 UPLOAD_DIR = os.path.abspath("./user_apps")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -37,15 +36,42 @@ if firebase_json:
     except Exception as e:
         raise RuntimeError(f"Invalid FIREBASE_SERVICE_ACCOUNT_JSON: {e}")
 
-if not firebase_admin._apps:
-    if FIREBASE_CONFIG:
-        cred = credentials.Certificate(FIREBASE_CONFIG)
-        firebase_admin.initialize_app(cred)
-    else:
-        # GOOGLE_APPLICATION_CREDENTIALS is supported automatically by Firebase/Google SDK.
-        firebase_admin.initialize_app()
+db = None
+_FIREBASE_LOCK = threading.RLock()
+_FIREBASE_ERROR = None
 
-db = firestore.client()
+def ensure_firebase():
+    global db, _FIREBASE_ERROR
+    if db is not None:
+        return db
+    with _FIREBASE_LOCK:
+        if db is not None:
+            return db
+        try:
+            if not firebase_admin._apps:
+                if FIREBASE_CONFIG:
+                    firebase_admin.initialize_app(credentials.Certificate(FIREBASE_CONFIG))
+                else:
+                    firebase_admin.initialize_app()
+            db = firestore.client()
+            _FIREBASE_ERROR = None
+            print("[FIREBASE] Connected")
+            return db
+        except Exception as e:
+            _FIREBASE_ERROR = str(e)
+            print(f"[FIREBASE ERROR] {e}")
+            raise
+
+@app.before_request
+def _firebase_before_request():
+    if request.path == "/health":
+        return None
+    try:
+        ensure_firebase()
+        maybe_init_default_admin()
+    except Exception as e:
+        return jsonify({"status":"error", "message":"Firebase initialization failed", "detail":str(e)}), 503
+    return None
 
 # app_id -> subprocess.Popen
 RUNNING_PROCESSES = {}
@@ -69,9 +95,18 @@ def init_default_admin():
     except Exception as e:
         print(f"[ADMIN INIT ERROR] {e}")
 
-init_default_admin()
+DEFAULT_ADMIN_INITIALIZED = False
+def maybe_init_default_admin():
+    global DEFAULT_ADMIN_INITIALIZED
+    if DEFAULT_ADMIN_INITIALIZED:
+        return
+    try:
+        init_default_admin()
+        DEFAULT_ADMIN_INITIALIZED = True
+    except Exception as e:
+        print(f"[ADMIN INIT ERROR] {e}")
 
-def get_client_ip(request: Request):
+def get_client_ip(request):
     x_forwarded = request.headers.get("X-Forwarded-For")
     if x_forwarded:
         return x_forwarded.split(",")[0]
@@ -526,15 +561,17 @@ HTML_TEMPLATE = """
 
 ACTIVE_SESSIONS = {}
 
-def get_current_session_id(request: Request, fallback: str = ""):
+def get_current_session_id(request, fallback: str = ""):
     return request.cookies.get("session_id") or fallback or ""
 
-def get_current_user(request: Request, fallback: str = ""):
+def get_current_user(request, fallback: str = ""):
     return ACTIVE_SESSIONS.get(get_current_session_id(request, fallback))
 
 
-@app.get("/", response_class=HTMLResponse)
-def index_page(request: Request, session_id: str = None, search_user: str = None):
+@app.route("/", methods=["GET"])
+def index_page():
+    session_id = request.cookies.get("session_id") or request.args.get("session_id") or ""
+    search_user = request.args.get("search_user")
     from jinja2 import Template
     session_id = get_current_session_id(request, session_id)
     current_user = ACTIVE_SESSIONS.get(session_id)
@@ -624,8 +661,11 @@ def index_page(request: Request, session_id: str = None, search_user: str = None
         error=None
     )
 
-@app.post("/auth")
-def authenticate(request: Request, username: str = Form(...), password: str = Form(...), action: str = Form(...)):
+@app.route("/auth", methods=["POST"])
+def authenticate():
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+    action = request.form.get("action", "")
     client_ip = get_client_ip(request)
 
     if action == "google_login":
@@ -646,8 +686,8 @@ def authenticate(request: Request, username: str = Form(...), password: str = Fo
 
         session_id = f"sess_{username}_{uuid.uuid4().hex}"
         ACTIVE_SESSIONS[session_id] = username
-        response = RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
-        response.set_cookie("session_id", session_id, httponly=True, samesite="lax", secure=False, max_age=86400)
+        response = redirect("/")
+        response.set_cookie("session_id", session_id, httponly=True, samesite="Lax", secure=bool(os.environ.get("COOKIE_SECURE", "false").lower() == "true"), max_age=86400)
         return response
 
     if action == "register":
@@ -661,7 +701,7 @@ def authenticate(request: Request, username: str = Form(...), password: str = Fo
                     blocked_until = datetime.strptime(blocked_until_str, "%Y-%m-%d %H:%M:%S")
                     if datetime.now() < blocked_until:
                         from jinja2 import Template
-                        return HTMLResponse(content=Template(HTML_TEMPLATE).render(
+                        return make_response(Template(HTML_TEMPLATE).render(
                             current_user=None, tg_admin=TELEGRAM_ADMIN,
                             error="IP Blocked! Multiple account creations detected. Try again after 24 Hours."
                         ))
@@ -676,7 +716,7 @@ def authenticate(request: Request, username: str = Form(...), password: str = Fo
                 "blocked_until": block_time
             })
             from jinja2 import Template
-            return HTMLResponse(content=Template(HTML_TEMPLATE).render(
+            return make_response(Template(HTML_TEMPLATE).render(
                 current_user=None, tg_admin=TELEGRAM_ADMIN,
                 error="Account limit reached for this IP! Blocked for 24 hours."
             ))
@@ -684,7 +724,7 @@ def authenticate(request: Request, username: str = Form(...), password: str = Fo
         user_ref = db.collection('users').document(username)
         if user_ref.get().exists:
             from jinja2 import Template
-            return HTMLResponse(content=Template(HTML_TEMPLATE).render(current_user=None, tg_admin=TELEGRAM_ADMIN, error="Username already exists!"))
+            return make_response(Template(HTML_TEMPLATE).render(current_user=None, tg_admin=TELEGRAM_ADMIN, error="Username already exists!"))
 
         expiry_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -709,19 +749,20 @@ def authenticate(request: Request, username: str = Form(...), password: str = Fo
     if u_doc.exists and u_doc.to_dict().get("password") == password:
         session_id = f"sess_{username}_{uuid.uuid4().hex}"
         ACTIVE_SESSIONS[session_id] = username
-        response = RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
-        response.set_cookie("session_id", session_id, httponly=True, samesite="lax", secure=False, max_age=86400)
+        response = redirect("/")
+        response.set_cookie("session_id", session_id, httponly=True, samesite="Lax", secure=bool(os.environ.get("COOKIE_SECURE", "false").lower() == "true"), max_age=86400)
         return response
 
     from jinja2 import Template
-    return HTMLResponse(content=Template(HTML_TEMPLATE).render(current_user=None, tg_admin=TELEGRAM_ADMIN, error="Invalid Credentials!"))
+    return make_response(Template(HTML_TEMPLATE).render(current_user=None, tg_admin=TELEGRAM_ADMIN, error="Invalid Credentials!"))
 
-@app.get("/get-messages")
-def get_messages(request: Request, target: str):
+@app.route("/get-messages", methods=["GET"])
+def get_messages():
+    target = request.args.get("target", "")
     session_id = get_current_session_id(request)
     current_user = ACTIVE_SESSIONS.get(session_id)
     if not current_user:
-        return {"messages": []}
+        return jsonify({"messages": []})
 
     msgs_ref = db.collection('messages').stream()
     all_msgs = [m.to_dict() for m in msgs_ref]
@@ -735,12 +776,14 @@ def get_messages(request: Request, target: str):
     filtered_msgs.sort(key=lambda x: x.get("timestamp", ""))
     return {"messages": filtered_msgs}
 
-@app.post("/send-message")
-def send_message(request: Request, receiver: str = Form(...), message: str = Form(...)):
+@app.route("/send-message", methods=["POST"])
+def send_message():
+    receiver = request.form.get("receiver", "")
+    message = request.form.get("message", "")
     session_id = get_current_session_id(request)
     current_user = ACTIVE_SESSIONS.get(session_id)
     if not current_user or not message.strip():
-        return {"status": "error"}
+        return jsonify({"status": "error"})
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.collection('messages').add({
@@ -749,28 +792,35 @@ def send_message(request: Request, receiver: str = Form(...), message: str = For
         "message": message,
         "timestamp": now_str
     })
-    return {"status": "ok"}
+    return jsonify({"status": "ok"})
 
-@app.post("/admin/change-my-pass")
-def admin_change_my_pass(request: Request, new_password: str = Form(...)):
+@app.route("/admin/change-my-pass", methods=["POST"])
+def admin_change_my_pass():
+    new_password = request.form.get("new_password", "")
     session_id = get_current_session_id(request)
     current_user = ACTIVE_SESSIONS.get(session_id)
     if current_user:
         db.collection('users').document(current_user).update({"password": new_password})
-    return RedirectResponse(url=f"/?session_id={session_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return redirect(f"/?session_id={session_id}")
 
-@app.post("/admin/change-user-pass")
-def admin_change_user_pass(request: Request, target_username: str = Form(...), new_password: str = Form(...)):
+@app.route("/admin/change-user-pass", methods=["POST"])
+def admin_change_user_pass():
+    target_username = request.form.get("target_username", "")
+    new_password = request.form.get("new_password", "")
     session_id = get_current_session_id(request)
     current_user = ACTIVE_SESSIONS.get(session_id)
     if current_user:
         u_doc = db.collection('users').document(current_user).get()
         if u_doc.exists and u_doc.to_dict().get("role") == "admin":
             db.collection('users').document(target_username).update({"password": new_password})
-    return RedirectResponse(url=f"/?session_id={session_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return redirect(f"/?session_id={session_id}")
 
-@app.post("/admin/manage-slots")
-def admin_manage_slots(request: Request, target_username: str = Form(...), slot_count: int = Form(...), duration_months: int = Form(1), action: str = Form(...)):
+@app.route("/admin/manage-slots", methods=["POST"])
+def admin_manage_slots():
+    target_username = request.form.get("target_username", "")
+    slot_count = int(request.form.get("slot_count", "0") or 0)
+    duration_months = int(request.form.get("duration_months", "1") or 1)
+    action = request.form.get("action", "")
     session_id = get_current_session_id(request)
     current_user = ACTIVE_SESSIONS.get(session_id)
     if current_user:
@@ -788,14 +838,14 @@ def admin_manage_slots(request: Request, target_username: str = Form(...), slot_
                 "max_slots": new_slots,
                 "slot_expiry": new_expiry
             })
-    return RedirectResponse(url=f"/?session_id={session_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return redirect(f"/?session_id={session_id}")
 
-@app.get("/logout")
-def logout(request: Request):
+@app.route("/logout", methods=["GET"])
+def logout():
     session_id = get_current_session_id(request)
     if session_id:
         ACTIVE_SESSIONS.pop(session_id, None)
-    response = RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+    response = redirect("/")
     response.delete_cookie("session_id")
     return response
 
@@ -904,17 +954,21 @@ def run_app_process(app_id, project_dir, entry_script):
         _append_process_log(app_id, f"[PROCESS START ERROR] {e}")
         return "error"
 
-@app.post("/deploy")
-async def deploy_app(app_name: str = Form(...), zip_file: UploadFile = File(...)):
+@app.route("/deploy", methods=["POST"])
+def deploy_app():
+    app_name = request.form.get("app_name", "").strip()
+    zip_file = request.files.get("zip_file")
+    if not app_name or zip_file is None or not zip_file.filename:
+        return redirect("/")
     if not ACTIVE_SESSIONS:
-        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+        return redirect("/")
 
     session_id = get_current_session_id(request)
     username = ACTIVE_SESSIONS.get(session_id)
 
     u_doc = db.collection('users').document(username).get()
     if not u_doc.exists:
-        return RedirectResponse(url=f"/?session_id={session_id}", status_code=status.HTTP_303_SEE_OTHER)
+        return redirect(f"/?session_id={session_id}")
 
     u_data = u_doc.to_dict()
     max_slots = u_data.get("max_slots", 1)
@@ -927,7 +981,7 @@ async def deploy_app(app_name: str = Form(...), zip_file: UploadFile = File(...)
 
     user_apps_docs = list(db.collection('apps').where(filter=FieldFilter('username', '==', username)).stream())
     if datetime.now() > slot_expiry or len(user_apps_docs) >= max_slots:
-        return RedirectResponse(url=f"/?session_id={session_id}", status_code=status.HTTP_303_SEE_OTHER)
+        return redirect(f"/?session_id={session_id}")
 
     safe_app_name = "".join(e for e in app_name if e.isalnum()).lower()
     app_id = f"{username}_{safe_app_name}"
@@ -937,11 +991,11 @@ async def deploy_app(app_name: str = Form(...), zip_file: UploadFile = File(...)
         shutil.rmtree(project_dir, ignore_errors=True)
     os.makedirs(project_dir, exist_ok=True)
 
-    file_filename = zip_file.filename
+    file_filename = os.path.basename(zip_file.filename)
     uploaded_file_path = os.path.join(project_dir, file_filename)
 
     with open(uploaded_file_path, "wb") as buffer:
-        shutil.copyfileobj(zip_file.file, buffer)
+        zip_file.save(buffer)
 
     if file_filename.endswith(".zip"):
         try:
@@ -983,10 +1037,10 @@ async def deploy_app(app_name: str = Form(...), zip_file: UploadFile = File(...)
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     })
 
-    return RedirectResponse(url=f"/?session_id={session_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return redirect(f"/?session_id={session_id}")
 
-@app.post("/start-app/{app_id}")
-def start_app(request: Request, app_id: str):
+@app.route("/start-app/<app_id>", methods=["POST"])
+def start_app(app_id):
     session_id = get_current_session_id(request)
     app_doc = db.collection('apps').document(app_id).get()
 
@@ -1008,14 +1062,14 @@ def start_app(request: Request, app_id: str):
         app_status = run_app_process(app_id, project_dir, entry_script)
         db.collection('apps').document(app_id).update({"status": app_status})
 
-    return RedirectResponse(url=f"/?session_id={session_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return redirect(f"/?session_id={session_id}")
 
-@app.post("/reload-app/{app_id}")
-def reload_app(request: Request, app_id: str):
+@app.route("/reload-app/<app_id>", methods=["POST"])
+def reload_app(app_id):
     return start_app(request, app_id)
 
-@app.post("/delete-app/{app_id}")
-def delete_app(request: Request, app_id: str):
+@app.route("/delete-app/<app_id>", methods=["POST"])
+def delete_app(app_id):
     session_id = get_current_session_id(request)
     if app_id in RUNNING_PROCESSES:
         try:
@@ -1036,10 +1090,10 @@ def delete_app(request: Request, app_id: str):
             shutil.rmtree(project_dir, ignore_errors=True)
 
     db.collection('apps').document(app_id).delete()
-    return RedirectResponse(url=f"/?session_id={session_id}", status_code=status.HTTP_303_SEE_OTHER)
+    return redirect(f"/?session_id={session_id}")
 
-@app.get("/get-app-logs/{app_id}")
-def get_app_logs(app_id: str, request: Request):
+@app.route("/get-app-logs/<app_id>", methods=["GET"])
+def get_app_logs(app_id):
     """Return live logs only when the current session owns the app (admins may view all)."""
     current_user = get_current_user(request)
     if not current_user:
@@ -1078,12 +1132,12 @@ def get_app_logs(app_id: str, request: Request):
         "status": "running" if running else app_data.get("status", "stopped")
     }
 
-@app.get("/health")
+@app.route("/health", methods=["GET"])
 def health():
     # Render health-check endpoint.
     return {"status": "ok", "service": "Render & Firebase PaaS Cloud Hosting Engine"}
 
 if __name__ == "__main__":
-    # Render provides PORT. Local development falls back to 8000.
-    port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=False, access_log=True)
+    port = int(os.environ.get("PORT", "10000"))
+    print(f"[SERVER] Starting Flask on 0.0.0.0:{port}", flush=True)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)
